@@ -450,36 +450,63 @@ const local = {
   set(k, v){ try{ localStorage.setItem(k, JSON.stringify(v)); }catch(e){ toast('Penyimpanan peramban penuh. Hapus sebagian banner foto.'); } }
 };
 
+// Jika Firestore menolak (aturan keamanan belum diizinkan), turunkan otomatis
+// ke penyimpanan lokal peramban supaya situs tetap bisa dipakai.
+let downgraded = false;
+function downgrade(reason){
+  if(MODE!=='firebase') return;
+  MODE = 'lokal'; downgraded = true;
+  const el = document.getElementById('mode-flag');
+  if(el){ el.textContent = 'Penyimpanan lokal (Firestore menolak akses)'; el.title = reason||''; }
+  toast('Firestore menolak akses (periksa Security Rules). Memakai penyimpanan lokal sementara.');
+  console.warn('Firestore ditolak, beralih ke penyimpanan lokal:', reason);
+}
+
 const DB = {
   async all(kind){
     if(MODE==='firebase'){
-      const s = await FS.getDocs(FS.collection(fdb, COL[kind]));
-      return s.docs.map(d=>({ id:d.id, ...d.data() }));
+      try{
+        const s = await FS.getDocs(FS.collection(fdb, COL[kind]));
+        return s.docs.map(d=>({ id:d.id, ...d.data() }));
+      }catch(e){ downgrade(e.message); }
     }
     return local.get(KEYS[kind], []);
   },
   async add(kind, obj){
     const item = { id: obj.id || (kind[0]+'-'+Date.now()+'-'+Math.floor(Math.random()*900+100)), ...obj };
-    if(MODE==='firebase') await FS.setDoc(FS.doc(fdb, COL[kind], item.id), item);
-    else { const arr = local.get(KEYS[kind], []); arr.unshift(item); local.set(KEYS[kind], arr); }
+    if(MODE==='firebase'){
+      try{ await FS.setDoc(FS.doc(fdb, COL[kind], item.id), item); return item; }
+      catch(e){ downgrade(e.message); }
+    }
+    const arr = local.get(KEYS[kind], []); arr.unshift(item); local.set(KEYS[kind], arr);
     return item;
   },
   async update(kind, id, patch){
-    if(MODE==='firebase') await FS.updateDoc(FS.doc(fdb, COL[kind], id), patch);
-    else { const arr=local.get(KEYS[kind],[]); const i=arr.findIndex(x=>x.id===id); if(i>-1){ arr[i]={...arr[i],...patch}; local.set(KEYS[kind],arr);} }
+    if(MODE==='firebase'){
+      try{ await FS.updateDoc(FS.doc(fdb, COL[kind], id), patch); return; }
+      catch(e){ downgrade(e.message); }
+    }
+    const arr=local.get(KEYS[kind],[]); const i=arr.findIndex(x=>x.id===id); if(i>-1){ arr[i]={...arr[i],...patch}; local.set(KEYS[kind],arr);}
   },
   async remove(kind, id){
-    if(MODE==='firebase') await FS.deleteDoc(FS.doc(fdb, COL[kind], id));
-    else local.set(KEYS[kind], local.get(KEYS[kind],[]).filter(x=>x.id!==id));
+    if(MODE==='firebase'){
+      try{ await FS.deleteDoc(FS.doc(fdb, COL[kind], id)); return; }
+      catch(e){ downgrade(e.message); }
+    }
+    local.set(KEYS[kind], local.get(KEYS[kind],[]).filter(x=>x.id!==id));
   },
   async seed(kind, rows){
     if(MODE==='firebase'){
-      const s = await FS.getDocs(FS.query(FS.collection(fdb, COL[kind]), FS.limit(1)));
-      if(!s.empty) return;
-      const b = FS.writeBatch(fdb);
-      rows.forEach(r => b.set(FS.doc(fdb, COL[kind], r.id), r));
-      await b.commit();
-    } else if(!local.get(KEYS[kind], null)) local.set(KEYS[kind], rows);
+      try{
+        const s = await FS.getDocs(FS.query(FS.collection(fdb, COL[kind]), FS.limit(1)));
+        if(!s.empty) return;
+        const b = FS.writeBatch(fdb);
+        rows.forEach(r => b.set(FS.doc(fdb, COL[kind], r.id), r));
+        await b.commit();
+        return;
+      }catch(e){ downgrade(e.message); }
+    }
+    if(!local.get(KEYS[kind], null)) local.set(KEYS[kind], rows);
   }
 };
 
@@ -1151,20 +1178,41 @@ function enterApp(){
   go(S.user.peran==='admin' ? 'admin' : 'feed');
 }
 (async function boot(){
-  $('#rg-kota').innerHTML = KOTA.map(k=>`<option>${k}</option>`).join('');
-  const ok = await initFirebase();
-  $('#mode-flag').textContent = ok ? 'Firebase Firestore aktif' : 'Penyimpanan lokal peramban';
+  try{
+    $('#rg-kota').innerHTML = KOTA.map(k=>`<option>${k}</option>`).join('');
+    const ok = await initFirebase();
+    $('#mode-flag').textContent = ok ? 'Firebase Firestore aktif' : 'Penyimpanan lokal peramban';
 
-  await Promise.all([ DB.seed('jobs',SEED_JOBS), DB.seed('users',SEED_USERS), DB.seed('apps',SEED_APPS), DB.seed('banners',SEED_BANNERS) ]);
-  [S.jobs, S.users, S.apps, S.banners] = await Promise.all([ DB.all('jobs'), DB.all('users'), DB.all('apps'), DB.all('banners') ]);
-  S.jobs.sort((a,b)=> new Date(b.posted)-new Date(a.posted));
+    await Promise.all([ DB.seed('jobs',SEED_JOBS), DB.seed('users',SEED_USERS), DB.seed('apps',SEED_APPS), DB.seed('banners',SEED_BANNERS) ]);
+    [S.jobs, S.users, S.apps, S.banners] = await Promise.all([ DB.all('jobs'), DB.all('users'), DB.all('apps'), DB.all('banners') ]);
+    S.jobs.sort((a,b)=> new Date(b.posted)-new Date(a.posted));
 
-  $('#stat-jobs').textContent = S.jobs.filter(j=>j.status==='Aktif').length;
-  $('#stat-co').textContent = new Set(S.jobs.map(j=>j.perusahaan)).size;
+    // Jaring pengaman terakhir: kalau karena satu dan lain hal koleksi tetap
+    // kosong (misalnya baru saja turun ke lokal di tengah proses), isi ulang
+    // dari data dummy supaya halaman masuk tidak pernah buntu.
+    if(!S.users.length) S.users = SEED_USERS;
+    if(!S.jobs.length) S.jobs = SEED_JOBS;
+    if(!S.apps.length) S.apps = SEED_APPS;
+    if(!S.banners.length) S.banners = SEED_BANNERS;
+    if(downgraded){
+      local.set(KEYS.jobs, S.jobs); local.set(KEYS.users, S.users);
+      local.set(KEYS.apps, S.apps); local.set(KEYS.banners, S.banners);
+    }
 
-  const sid = local.get(KEYS.session, null);
-  const u = sid && S.users.find(x=>x.id===sid);
-  if(u){ S.user=u; S.saved=local.get(KEYS.saved+'_'+u.id,[]); enterApp(); }
+    $('#stat-jobs').textContent = S.jobs.filter(j=>j.status==='Aktif').length;
+    $('#stat-co').textContent = new Set(S.jobs.map(j=>j.perusahaan)).size;
+
+    const sid = local.get(KEYS.session, null);
+    const u = sid && S.users.find(x=>x.id===sid);
+    if(u){ S.user=u; S.saved=local.get(KEYS.saved+'_'+u.id,[]); enterApp(); }
+  }catch(e){
+    console.error('Gagal memuat aplikasi:', e);
+    $('#mode-flag').textContent = 'Terjadi kendala saat memuat data';
+    S.users = SEED_USERS; S.jobs = SEED_JOBS; S.apps = SEED_APPS; S.banners = SEED_BANNERS;
+    $('#stat-jobs').textContent = S.jobs.filter(j=>j.status==='Aktif').length;
+    $('#stat-co').textContent = new Set(S.jobs.map(j=>j.perusahaan)).size;
+    toast('Terjadi kendala saat memuat data. Halaman masuk tetap bisa dipakai dengan akun demo.');
+  }
 })();
 </script>
 </body>
